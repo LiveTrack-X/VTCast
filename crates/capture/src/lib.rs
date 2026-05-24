@@ -141,6 +141,83 @@ impl SpoutReceiver {
             )))
     }
 
+    /// Open the sender on a Media-Foundation-capable *shared* device — the
+    /// device the GPU zero-copy pipeline reuses for the NV12 conversion
+    /// shader and the encoder MFT.
+    ///
+    /// Like [`open`] this probes DXGI adapters until one can open the shared
+    /// handle, but each candidate device is created via
+    /// [`d3d11::create_shared_device`] (BGRA + video support + multithread
+    /// protected). Returns the receiver plus the lowercased adapter name so
+    /// the caller can pick the matching hardware encoder MFT (the encoder has
+    /// to live on the same GPU as the texture).
+    pub fn open_shared(sender_name: &str) -> Result<(Self, String)> {
+        let info = read_sender_info(sender_name)?;
+        let raw_handle = info.share_handle as usize as *mut std::ffi::c_void;
+        let handle = HANDLE(raw_handle);
+
+        let adapters = d3d11::enumerate_adapters()?;
+        let mut last_err: Option<anyhow::Error> = None;
+        for (adapter_name, adapter) in adapters {
+            let (device, context) = match d3d11::create_shared_device(Some(&adapter)) {
+                Ok(d) => d,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            match Self::try_open_shared(&device, handle) {
+                Ok(shared_tex) => {
+                    let staging = d3d11::create_staging_texture(
+                        &device,
+                        info.width,
+                        info.height,
+                        DXGI_FORMAT(info.format as i32),
+                    )?;
+                    let lname = adapter_name.to_lowercase();
+                    return Ok((
+                        Self {
+                            sender_name: sender_name.to_string(),
+                            info,
+                            _device: device,
+                            context,
+                            shared_tex,
+                            staging,
+                            adapter_name,
+                        },
+                        lname,
+                    ));
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow!("no DXGI adapters available"))
+            .context(format!(
+                "no shared-capable adapter could open handle 0x{:08x} for sender '{}'",
+                info.share_handle, sender_name
+            )))
+    }
+
+    /// The D3D11 device this receiver's textures live on. The GPU pipeline
+    /// shares this with the conversion shader and the encoder.
+    pub fn device(&self) -> &ID3D11Device {
+        &self._device
+    }
+
+    /// The immediate context paired with [`device`]. Single-threaded use
+    /// only; the device itself is multithread-protected for MF.
+    pub fn context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+
+    /// The opened Spout shared texture (source RGBA/BGRA). Sample this from a
+    /// shader via an SRV, or snapshot it with `CopyResource` first to avoid
+    /// tearing against the sender's writes.
+    pub fn shared_texture(&self) -> &ID3D11Texture2D {
+        &self.shared_tex
+    }
+
     fn try_open_shared(
         device: &ID3D11Device,
         handle: HANDLE,

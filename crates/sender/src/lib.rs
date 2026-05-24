@@ -7,7 +7,11 @@
 
 pub mod encoder;
 #[cfg(windows)]
+pub mod gpu_convert;
+#[cfg(windows)]
 pub mod mf_encoder;
+#[cfg(windows)]
+pub mod nvenc;
 mod packer;
 mod publisher;
 mod resize;
@@ -218,6 +222,23 @@ impl Pipeline {
             config.relay_url.trim_end_matches('/'),
             room
         );
+
+        // GPU zero-copy fast path: any Spout source on a GPU with a usable
+        // hardware encoder (NVENC on NVIDIA, Media Foundation QSV/AMF on
+        // Intel/AMD). Keeps the frame in VRAM end to end — no readback, no
+        // pack/convert on the CPU, no raw-RGBA pipe — which is the whole point
+        // of cutting host load. Preferred regardless of the `backend` setting
+        // (that now selects only the fallback for when this path isn't
+        // viable). Any failure here drops through to the CPU pipeline below.
+        #[cfg(windows)]
+        if matches!(config.source_kind, SourceKind::Spout) {
+            match try_start_gpu_spout(&config, &room, &receiver_url).await {
+                Some(pipeline) => return Ok(pipeline),
+                None => tracing::info!(
+                    "GPU zero-copy path unavailable; using CPU capture+encode pipeline"
+                ),
+            }
+        }
 
         let (rx, source) = open_capture(&config)?;
         let (raw_w, raw_h) = rx.dimensions();
@@ -853,6 +874,442 @@ async fn publisher_worker(
         tokio::time::sleep(backoff).await;
         backoff = std::cmp::min(backoff * 2, RECONNECT_MAX_BACKOFF);
     }
+}
+
+/// Resolve the Spout sender name the GPU path will open: explicit config
+/// value, else the first broadcasting sender.
+#[cfg(windows)]
+fn resolve_spout_name(config: &Config) -> Option<String> {
+    match config.sender_name.clone() {
+        Some(n) => Some(n),
+        None => list_senders().ok()?.into_iter().next(),
+    }
+}
+
+/// Try to stand up the GPU zero-copy pipeline for a Spout source. Returns
+/// `Some(Pipeline)` once the source is validated and the encode task is
+/// spawned, or `None` to signal the caller to fall back to the CPU pipeline.
+///
+/// The validation probe opens the Spout handle on a shared D3D11 device to
+/// confirm eligibility and read dimensions/adapter, then drops it — the
+/// encode worker re-opens on its own thread because the D3D/MF COM objects
+/// aren't `Send`.
+#[cfg(windows)]
+async fn try_start_gpu_spout(config: &Config, room: &str, receiver_url: &str) -> Option<Pipeline> {
+    let name = resolve_spout_name(config)?;
+
+    let (raw_w, raw_h, adapter) = {
+        let (recv, _vendor) = match SpoutReceiver::open_shared(&name) {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::debug!(error = ?e, "open_shared probe failed; GPU path skipped");
+                return None;
+            }
+        };
+        let (w, h) = recv.dimensions();
+        (w, h, recv.adapter_name().to_string())
+        // recv dropped here — re-opened on the worker thread.
+    };
+
+    // Eligibility depends on the capture GPU's vendor: NVIDIA goes through the
+    // NVENC SDK (its MF MFT is broken), everyone else through a Media
+    // Foundation hardware MFT. Probe the matching encoder's availability
+    // cheaply before committing — otherwise fall back to the CPU pipeline.
+    let viable = if adapter.to_lowercase().contains("nvidia") {
+        crate::nvenc::NvencApi::load().is_ok()
+    } else {
+        mf_encoder::hardware_h264_available()
+    };
+    if !viable {
+        tracing::info!(%adapter, "no usable GPU encoder for this adapter; using CPU pipeline");
+        return None;
+    }
+
+    let (src_w, src_h) = resize::compute_effective_dims(raw_w, raw_h, config.max_packed_width);
+    let (packed_w, packed_h) = packer::packed_dims(src_w, src_h);
+    tracing::info!(
+        source = %name,
+        src = format!("{src_w}x{src_h}"),
+        packed = format!("{packed_w}x{packed_h}"),
+        %adapter,
+        "GPU zero-copy pipeline opening"
+    );
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let frame_interval = Duration::from_secs_f64(1.0 / config.fps as f64);
+    let (events_tx, events_rx) = mpsc::channel::<PipelineEvent>(EVENT_CHANNEL_DEPTH);
+    let (au_tx, au_rx) = mpsc::channel::<Vec<u8>>(AU_CHANNEL_DEPTH);
+    // The worker reports whether it got all the way through init (device +
+    // converter + encoder + a warmup frame) before we commit to the GPU path.
+    let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+
+    let ctx = GpuCtx {
+        sender_name: name.clone(),
+        adapter: adapter.clone(),
+        packed_w,
+        packed_h,
+        fps: config.fps,
+        bitrate_kbps: config.bitrate_kbps,
+        frame_interval,
+        shutdown: Arc::clone(&shutdown),
+    };
+    let encode_task = tokio::task::spawn_blocking(move || gpu_encode_loop(ctx, au_tx, init_tx));
+
+    // Block on init before committing. Any failure (or timeout, or the worker
+    // dying early) drops us back to the CPU pipeline instead of leaving a dead
+    // GPU pipeline. The warmup encode inside the worker means a successful
+    // signal has actually produced one frame end-to-end.
+    match tokio::time::timeout(Duration::from_secs(10), init_rx).await {
+        Ok(Ok(Ok(()))) => {}
+        other => {
+            shutdown.store(true, Ordering::Relaxed);
+            let reason = match other {
+                Ok(Ok(Err(e))) => e,
+                Ok(Err(_)) => "GPU worker exited before signalling init".to_string(),
+                Err(_) => "GPU worker init timed out".to_string(),
+                Ok(Ok(Ok(()))) => unreachable!(),
+            };
+            tracing::info!(%reason, "GPU init failed; falling back to CPU pipeline");
+            return None;
+        }
+    }
+
+    // Committed: announce the source and wire up the publisher + supervisor.
+    let source = SourceInfo {
+        sender_name: name,
+        width: src_w,
+        height: src_h,
+        adapter: format!("{adapter} (GPU)"),
+    };
+    let _ = events_tx
+        .send(PipelineEvent::Started {
+            room: room.to_string(),
+            receiver_url: receiver_url.to_string(),
+            source,
+        })
+        .await;
+
+    let publisher_loop = tokio::spawn(publisher_worker(
+        config.relay_url.clone(),
+        room.to_string(),
+        au_rx,
+        frame_interval,
+        Arc::clone(&shutdown),
+        events_tx.clone(),
+    ));
+
+    let sup_shutdown = Arc::clone(&shutdown);
+    let orchestrator = tokio::spawn(async move {
+        tokio::select! {
+            r = encode_task => tracing::info!(result = ?r, "GPU encode task exited"),
+            r = publisher_loop => tracing::info!(reason = ?r, "publisher loop exited (GPU)"),
+        }
+        sup_shutdown.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = events_tx.send(PipelineEvent::Stopped).await;
+    });
+
+    Some(Pipeline {
+        shutdown,
+        events_rx,
+        _orchestrator: orchestrator,
+    })
+}
+
+#[cfg(windows)]
+struct GpuCtx {
+    sender_name: String,
+    /// Adapter description of the GPU the Spout texture lives on; drives the
+    /// NVENC-vs-MF branch and the preferred encoder-MFT vendor order.
+    adapter: String,
+    packed_w: u32,
+    packed_h: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    frame_interval: Duration,
+    shutdown: Arc<AtomicBool>,
+}
+
+/// The fused GPU pipeline body, run on a blocking thread. Re-opens the Spout
+/// receiver here (COM objects aren't `Send`), builds the NV12 converter +
+/// encoder on the single shared device, then loops: snapshot+convert on the
+/// GPU, hand the NV12 texture straight to the encoder, forward access units.
+#[cfg(windows)]
+fn gpu_encode_loop(
+    ctx: GpuCtx,
+    au_tx: mpsc::Sender<Vec<u8>>,
+    init_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+) {
+    use crate::gpu_convert::Nv12Converter;
+
+    let GpuCtx {
+        sender_name,
+        adapter,
+        packed_w,
+        packed_h,
+        fps,
+        bitrate_kbps,
+        frame_interval,
+        shutdown,
+    } = ctx;
+
+    let (recv, _vendor) = match SpoutReceiver::open_shared(&sender_name) {
+        Ok(x) => x,
+        Err(e) => {
+            let _ = init_tx.send(Err(format!("re-open Spout on worker thread: {e:#}")));
+            return;
+        }
+    };
+    let device = recv.device().clone();
+    let context = recv.context().clone();
+    let (src_w, src_h) = recv.dimensions();
+    let src_format = recv.format();
+
+    let converter = match Nv12Converter::new(
+        &device,
+        &context,
+        recv.shared_texture(),
+        src_w,
+        src_h,
+        src_format,
+        packed_w,
+        packed_h,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = init_tx.send(Err(format!("NV12 converter init: {e:#}")));
+            return;
+        }
+    };
+
+    // NVIDIA's Media Foundation MFT is broken on current drivers, so NVIDIA
+    // takes the direct-NVENC path; Intel/AMD use their (working) MF MFT. Both
+    // consume the converter's NV12 textures straight from VRAM, and both
+    // signal `init_tx` once (Ok after a warmup / encoder open, Err on failure)
+    // so the supervisor can fall back to the CPU pipeline if init fails.
+    let la = adapter.to_lowercase();
+    if la.contains("nvidia") {
+        run_nvenc_encode(
+            &device,
+            &converter,
+            packed_w,
+            packed_h,
+            fps,
+            bitrate_kbps,
+            frame_interval,
+            &shutdown,
+            &au_tx,
+            init_tx,
+        );
+    } else {
+        run_mf_gpu_encode(
+            &device,
+            &converter,
+            packed_w,
+            packed_h,
+            fps,
+            bitrate_kbps,
+            frame_interval,
+            &shutdown,
+            &au_tx,
+            init_tx,
+        );
+    }
+
+    // Keep the receiver alive for the whole loop; its textures back the
+    // converter's source clone.
+    drop(recv);
+    tracing::info!("GPU encode loop ended");
+}
+
+/// NVIDIA path: encode the converter's NV12 textures directly through the
+/// NVENC SDK (zero-copy from VRAM). Synchronous — one access unit per frame.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn run_nvenc_encode(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    converter: &crate::gpu_convert::Nv12Converter,
+    packed_w: u32,
+    packed_h: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    frame_interval: Duration,
+    shutdown: &Arc<AtomicBool>,
+    au_tx: &mpsc::Sender<Vec<u8>>,
+    init_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+) {
+    // Init: load → open session → configure. Each failure reports via init_tx
+    // so the supervisor falls back to the CPU pipeline.
+    let api = match crate::nvenc::NvencApi::load() {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = init_tx.send(Err(format!("NVENC load: {e:#}")));
+            return;
+        }
+    };
+    let mut session = match api.open_session(device) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = init_tx.send(Err(format!("NVENC open_session: {e:#}")));
+            return;
+        }
+    };
+    if let Err(e) = session.initialize(packed_w, packed_h, fps, bitrate_kbps) {
+        let _ = init_tx.send(Err(format!("NVENC initialize: {e:#}")));
+        return;
+    }
+
+    // Warmup: convert + encode one frame so registering the input texture and
+    // the first encode are validated before we commit. The warmup AU is a
+    // valid keyframe, so forward it.
+    let mut produced: u64 = 0;
+    let mut dropped: u64 = 0;
+    match converter.convert() {
+        Ok(tex) => match session.encode_texture(tex) {
+            Ok(au_opt) => {
+                let _ = init_tx.send(Ok(()));
+                if let Some(au) = au_opt {
+                    produced += 1;
+                    let _ = au_tx.try_send(au);
+                }
+            }
+            Err(e) => {
+                let _ = init_tx.send(Err(format!("NVENC warmup encode: {e:#}")));
+                return;
+            }
+        },
+        Err(e) => {
+            let _ = init_tx.send(Err(format!("NV12 convert warmup: {e:#}")));
+            return;
+        }
+    }
+    tracing::info!(
+        size = format!("{packed_w}x{packed_h}"),
+        "NVENC zero-copy encoder initialized"
+    );
+
+    let mut next = std::time::Instant::now();
+    while !shutdown.load(Ordering::Relaxed) {
+        match converter.convert() {
+            Ok(tex) => match session.encode_texture(tex) {
+                Ok(Some(au)) => {
+                    produced += 1;
+                    if au_tx.try_send(au).is_err() {
+                        dropped += 1;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(error = ?e, "NVENC encode_texture failed");
+                    break;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = ?e, "NVENC loop: convert failed");
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        }
+        next += frame_interval;
+        let now = std::time::Instant::now();
+        if next > now {
+            std::thread::sleep(next - now);
+        } else {
+            next = now;
+        }
+    }
+    tracing::info!(produced, dropped, "NVENC encode loop ended");
+}
+
+/// Intel/AMD path: feed the converter's NV12 textures to the vendor's Media
+/// Foundation hardware MFT (which, unlike NVIDIA's, works) on the same GPU.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn run_mf_gpu_encode(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    converter: &crate::gpu_convert::Nv12Converter,
+    packed_w: u32,
+    packed_h: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    frame_interval: Duration,
+    shutdown: &Arc<AtomicBool>,
+    au_tx: &mpsc::Sender<Vec<u8>>,
+    init_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+) {
+    use crate::mf_encoder::AsyncMfEncoder;
+    let mut encoder = None;
+    for name in ["quick sync", "amf", "nvidia"] {
+        match AsyncMfEncoder::open_with_device(name, device, packed_w, packed_h, fps, bitrate_kbps) {
+            Ok(e) => {
+                tracing::info!(mft = name, "GPU MF encoder opened on shared device");
+                encoder = Some(e);
+                break;
+            }
+            Err(e) => tracing::debug!(mft = name, error = ?e, "shared-device MFT not usable"),
+        }
+    }
+    let Some(mut encoder) = encoder else {
+        let _ = init_tx.send(Err(
+            "no usable hardware MFT opened on the shared device".to_string()
+        ));
+        return;
+    };
+    // Opening the MFT validated the NV12-in/H.264-out params (SetInputType /
+    // SetOutputType), which is the main failure mode — signal success.
+    let _ = init_tx.send(Ok(()));
+
+    let mut produced: u64 = 0;
+    let mut dropped: u64 = 0;
+    let mut next = std::time::Instant::now();
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        // Cap convert-ahead at 2 frames so we never overwrite an NV12 ring
+        // slot the encoder still references.
+        if encoder.texture_backlog() < 2 {
+            match converter.convert() {
+                Ok(nv12) => {
+                    if let Err(e) = encoder.enqueue_texture(nv12) {
+                        tracing::error!(error = ?e, "GPU loop: enqueue_texture failed");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "GPU loop: convert failed");
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+            }
+        }
+        match encoder.pump_textures(32) {
+            Ok(aus) => {
+                for au in aus {
+                    produced += 1;
+                    if au_tx.try_send(au).is_err() {
+                        dropped += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "GPU loop: pump_textures failed");
+                break;
+            }
+        }
+        next += frame_interval;
+        let now = std::time::Instant::now();
+        if next > now {
+            std::thread::sleep(next - now);
+        } else {
+            next = now;
+        }
+    }
+    let tail = encoder.finish().unwrap_or_default();
+    for au in tail {
+        let _ = au_tx.try_send(au);
+    }
+    tracing::info!(produced, dropped, "MF GPU encode loop ended");
 }
 
 async fn mint_room(relay: &str) -> Result<String> {

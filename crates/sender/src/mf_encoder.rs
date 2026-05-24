@@ -16,12 +16,13 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11Multithread, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+    D3D11CreateDevice, ID3D11Device, ID3D11Multithread, ID3D11Texture2D,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
 };
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFAttributes, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
+    IMFActivate, IMFAttributes, IMFMediaBuffer, IMFMediaEventGenerator, IMFMediaType, IMFSample,
+    IMFTransform, MFCreateDXGISurfaceBuffer,
     MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFStartup,
     MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_ASYNCMFT,
     MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
@@ -40,11 +41,18 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-static MF_INIT: OnceLock<()> = OnceLock::new();
+static MF_STARTED: OnceLock<()> = OnceLock::new();
 
 pub fn ensure_mf_initialized() -> Result<()> {
-    MF_INIT.get_or_init(|| unsafe {
+    // CoInitializeEx is *per-thread* — every thread that activates or drives
+    // an MFT must be in the MTA, or hardware MFTs (NVIDIA's especially) fail
+    // ActivateObject with E_UNEXPECTED (0x8000FFFF). So call it on each entry
+    // (idempotent per thread, returns S_FALSE if already initialised). Only
+    // MFStartup is process-wide and guarded by the OnceLock.
+    unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    MF_STARTED.get_or_init(|| unsafe {
         if let Err(e) = MFStartup(MF_VERSION, 0) {
             tracing::error!(error = ?e, "MFStartup failed");
         }
@@ -510,6 +518,10 @@ pub struct AsyncMfEncoder {
     next_pts_hns: i64,
     pending_need_input: u32,
     finished: bool,
+    /// Samples backed by D3D11 textures awaiting a NeedInput slot. Separate
+    /// from the caller's NV12-byte queue used by [`pump`]; the GPU path feeds
+    /// this via [`enqueue_texture`] + [`pump_textures`].
+    tex_queue: VecDeque<IMFSample>,
     /// Held to keep the D3D11 device + DXGI manager alive while the MFT
     /// references them. Some hardware MFTs refuse to run without a
     /// device manager (NVIDIA NVENC specifically returns E_UNEXPECTED on
@@ -528,6 +540,41 @@ impl AsyncMfEncoder {
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<Self> {
+        Self::open_inner(name_match, None, width, height, fps, bitrate_kbps)
+    }
+
+    /// Open the encoder reusing a caller-provided D3D11 device — the device
+    /// the GPU zero-copy pipeline also uses for Spout capture + NV12
+    /// conversion. The encoder MFT must live on the same GPU as its input
+    /// textures, so the caller (which opened the Spout shared handle) owns
+    /// the device choice. Pair with [`submit_input_texture`] /
+    /// [`enqueue_texture`] for the zero-copy path.
+    pub fn open_with_device(
+        name_match: &str,
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self> {
+        Self::open_inner(
+            name_match,
+            Some(device.clone()),
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+        )
+    }
+
+    fn open_inner(
+        name_match: &str,
+        provided_device: Option<ID3D11Device>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self> {
         ensure_mf_initialized()?;
 
         let want = name_match.to_lowercase();
@@ -538,24 +585,34 @@ impl AsyncMfEncoder {
             .ok_or_else(|| anyhow!("no async H.264 MFT name matches '{}'", name_match))?;
         tracing::info!(mft = %picked_name, "opening async MFT");
 
-        // Pick a D3D11 adapter matching the MFT's vendor. NVIDIA's MFT
-        // and Intel QSV each want a device on their own GPU; mixing
-        // them (NVIDIA D3D into QSV, or vice versa) causes
-        // SetOutputType to reject the input format.
-        let adapter_hint = if want.contains("nvidia") {
-            Some("nvidia")
-        } else if want.contains("quick sync") || want.contains("intel") {
-            Some("intel")
-        } else if want.contains("amf") || want.contains("amd") || want.contains("radeon") {
-            Some("amd")
-        } else {
-            None
-        };
-        let (d3d_device, d3d_manager) = match create_d3d_manager_for(adapter_hint) {
-            Ok((dev, mgr)) => (Some(dev), Some(mgr)),
-            Err(e) => {
-                tracing::debug!(error = ?e, "no D3D manager; some hardware MFTs may refuse to activate");
-                (None, None)
+        let (d3d_device, d3d_manager) = match provided_device {
+            // Zero-copy path: reuse the capture/conversion device so the MFT
+            // reads our NV12 textures straight from VRAM.
+            Some(dev) => {
+                let mgr =
+                    create_dxgi_manager(&dev).context("DXGI manager from provided device")?;
+                (Some(dev), Some(mgr))
+            }
+            // Stand-alone path: pick a D3D11 adapter matching the MFT's vendor.
+            // NVIDIA's MFT and Intel QSV each want a device on their own GPU;
+            // mixing them causes SetOutputType to reject the input format.
+            None => {
+                let adapter_hint = if want.contains("nvidia") {
+                    Some("nvidia")
+                } else if want.contains("quick sync") || want.contains("intel") {
+                    Some("intel")
+                } else if want.contains("amf") || want.contains("amd") || want.contains("radeon") {
+                    Some("amd")
+                } else {
+                    None
+                };
+                match create_d3d_manager_for(adapter_hint) {
+                    Ok((dev, mgr)) => (Some(dev), Some(mgr)),
+                    Err(e) => {
+                        tracing::debug!(error = ?e, "no D3D manager; some hardware MFTs may refuse to activate");
+                        (None, None)
+                    }
+                }
             }
         };
 
@@ -633,6 +690,7 @@ impl AsyncMfEncoder {
             next_pts_hns: 0,
             pending_need_input: 0,
             finished: false,
+            tex_queue: VecDeque::new(),
             d3d_device,
             d3d_manager,
         })
@@ -720,6 +778,86 @@ impl AsyncMfEncoder {
                 .ok();
         }
         Ok(all)
+    }
+
+    /// Wrap a D3D11 texture (NV12, on the encoder's device) in an `IMFSample`
+    /// backed by the DXGI surface — no CPU copy. Stamps the running PTS.
+    fn make_texture_sample(&mut self, tex: &ID3D11Texture2D) -> Result<IMFSample> {
+        let buf: IMFMediaBuffer = unsafe {
+            MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, tex, 0, false)
+        }
+        .context("MFCreateDXGISurfaceBuffer")?;
+        let sample: IMFSample = unsafe { MFCreateSample() }.context("MFCreateSample (tex)")?;
+        unsafe {
+            sample.AddBuffer(&buf).context("AddBuffer (tex)")?;
+            sample
+                .SetSampleTime(self.next_pts_hns)
+                .context("SetSampleTime (tex)")?;
+            sample
+                .SetSampleDuration(self.frame_duration_hns)
+                .context("SetSampleDuration (tex)")?;
+        }
+        self.next_pts_hns += self.frame_duration_hns;
+        Ok(sample)
+    }
+
+    /// Queue an NV12 D3D11 texture for the zero-copy path. The texture must
+    /// live on the device passed to [`open_with_device`]. The created sample
+    /// keeps the texture referenced until the MFT consumes it, so callers can
+    /// cycle a small ring of textures safely.
+    pub fn enqueue_texture(&mut self, tex: &ID3D11Texture2D) -> Result<()> {
+        let sample = self.make_texture_sample(tex)?;
+        self.tex_queue.push_back(sample);
+        Ok(())
+    }
+
+    /// Number of queued-but-not-yet-submitted texture samples. Callers use
+    /// this to bound how far ahead of the encoder they convert.
+    pub fn texture_backlog(&self) -> usize {
+        self.tex_queue.len()
+    }
+
+    /// Drive the async MFT for the texture path: satisfy NeedInput from the
+    /// internal texture-sample queue and collect HaveOutput access units.
+    /// Mirrors [`pump`] but sources input from [`enqueue_texture`] instead of
+    /// a caller-held NV12-byte queue.
+    pub fn pump_textures(&mut self, max_iters: u32) -> Result<Vec<Vec<u8>>> {
+        let mut aus = Vec::new();
+        for _ in 0..max_iters {
+            // Clear any deferred NeedInput requests first.
+            while self.pending_need_input > 0 {
+                let Some(sample) = self.tex_queue.pop_front() else {
+                    break;
+                };
+                unsafe { self.transform.ProcessInput(0, &sample, 0) }
+                    .context("ProcessInput (tex)")?;
+                self.pending_need_input -= 1;
+            }
+
+            let ev = unsafe { self.event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) };
+            match ev {
+                Ok(ev) => {
+                    let ev_type = unsafe { ev.GetType() }.context("event GetType")?;
+                    if ev_type == METransformNeedInput.0 as u32 {
+                        if let Some(sample) = self.tex_queue.pop_front() {
+                            unsafe { self.transform.ProcessInput(0, &sample, 0) }
+                                .context("ProcessInput (tex)")?;
+                        } else {
+                            self.pending_need_input += 1;
+                        }
+                    } else if ev_type == METransformHaveOutput.0 as u32 {
+                        if let Some(au) = self.drain_one_output()? {
+                            aus.push(au);
+                        }
+                    } else if ev_type == METransformDrainComplete.0 as u32 {
+                        self.finished = true;
+                    }
+                }
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(aus),
+                Err(e) => return Err(anyhow!("GetEvent: {}", e)),
+            }
+        }
+        Ok(aus)
     }
 
     fn submit_input(&mut self, nv12: &[u8]) -> Result<()> {
@@ -848,12 +986,19 @@ fn create_d3d_manager_for(
     }
     let device = device.ok_or_else(|| anyhow!("D3D11 device null"))?;
 
-    // MF accesses the D3D device from worker threads, so multithread
-    // protection is mandatory.
+    let manager = create_dxgi_manager(&device)?;
+    Ok((device, manager))
+}
+
+/// Wrap an existing D3D11 device in an `IMFDXGIDeviceManager` for hardware
+/// MFTs. Ensures multithread protection (MF drives the device from worker
+/// threads) before handing it over. Shared by the stand-alone path
+/// ([`create_d3d_manager_for`]) and the zero-copy path
+/// ([`AsyncMfEncoder::open_with_device`]).
+fn create_dxgi_manager(device: &ID3D11Device) -> Result<IMFDXGIDeviceManager> {
     if let Ok(mt) = device.cast::<ID3D11Multithread>() {
         let _ = unsafe { mt.SetMultithreadProtected(true) };
     }
-
     let mut reset_token = 0u32;
     let mut manager: Option<IMFDXGIDeviceManager> = None;
     unsafe {
@@ -863,10 +1008,10 @@ fn create_d3d_manager_for(
     let manager = manager.ok_or_else(|| anyhow!("DXGI manager null"))?;
     unsafe {
         manager
-            .ResetDevice(&device, reset_token)
+            .ResetDevice(device, reset_token)
             .context("IMFDXGIDeviceManager::ResetDevice")?;
     }
-    Ok((device, manager))
+    Ok(manager)
 }
 
 /// Walk DXGI adapters and find one matching `vendor_hint`. With None,
@@ -910,6 +1055,16 @@ fn pick_adapter_for_vendor(vendor_hint: Option<&str>) -> Option<(String, IDXGIAd
         }
         matched.or(first_any)
     }
+}
+
+/// Whether at least one hardware async H.264 MFT (NVENC / QSV / AMF) is
+/// registered. Pure enumeration — does not activate any encoder, so it's
+/// safe to call as a cheap GPU-path eligibility probe without risking the
+/// double-activation flakiness some drivers show.
+pub fn hardware_h264_available() -> bool {
+    enumerate_all_h264_activates_async()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
 }
 
 fn enumerate_all_h264_activates_async() -> Result<Vec<(String, IMFActivate)>> {
