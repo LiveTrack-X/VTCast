@@ -38,6 +38,12 @@ use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
+/// Max time to wait for any inbound WS frame before declaring the connection
+/// half-open. The relay pings every 30s (protocol-level Ping frames), so 90s
+/// means 3 consecutive missed pings — the relay leg is dead and the pump must
+/// end so the reconnect loop can take over.
+const WS_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 pub struct Publisher {
     /// Shared H.264 sample track. Caller writes encoded access units here;
     /// webrtc-rs forwards each sample into every active subscriber PC.
@@ -137,10 +143,18 @@ impl Publisher {
 
         let state_in = Arc::clone(&state);
         let inbound = tokio::spawn(async move {
-            while let Some(frame) = ws_in.next().await {
-                let frame = match frame {
-                    Ok(f) => f,
-                    Err(e) => {
+            loop {
+                let frame = match tokio::time::timeout(WS_READ_TIMEOUT, ws_in.next()).await {
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_secs = WS_READ_TIMEOUT.as_secs(),
+                            "no ws frame (not even relay ping) within read timeout; assuming half-open connection"
+                        );
+                        return PumpEnded::WsClosed;
+                    }
+                    Ok(None) => return PumpEnded::WsClosed,
+                    Ok(Some(Ok(f))) => f,
+                    Ok(Some(Err(e))) => {
                         tracing::warn!(error = ?e, "ws inbound");
                         return PumpEnded::WsClosed;
                     }
@@ -165,7 +179,6 @@ impl Publisher {
                     tracing::warn!(error = ?e, "inbound handler");
                 }
             }
-            PumpEnded::WsClosed
         });
 
         let outbound = tokio::spawn(async move {
