@@ -138,7 +138,7 @@ fn default_source_kind() -> SourceKind {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            relay_url: "https://vtcast.jamku.me".to_string(),
+            relay_url: "https://vtcast.livetrack.kr".to_string(),
             room: None,
             sender_name: None,
             fps: 30,

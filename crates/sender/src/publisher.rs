@@ -97,6 +97,24 @@ impl Publisher {
             .with_context(|| format!("connect_async {ws_url}"))?;
         let (mut ws_out, mut ws_in) = ws_stream.split();
 
+        // Send Hello before doing the comparatively expensive WebRTC setup.
+        // The relay may send a keepalive Ping immediately after the upgrade;
+        // if the client processes and answers that Ping first, the relay's
+        // Hello phase can see the Pong as the first frame and close the socket.
+        let hello = Envelope {
+            seq: 0,
+            msg: Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                role: Role::Publisher,
+                room: RoomCode(room.to_string()),
+            },
+        };
+        let hello_json = serde_json::to_string(&hello).context("serialize relay Hello")?;
+        ws_out
+            .send(WsMessage::Text(hello_json.into()))
+            .await
+            .context("send relay Hello")?;
+
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Envelope>();
 
         // Build one API + media engine + interceptor registry. The same API
@@ -131,15 +149,6 @@ impl Publisher {
             pcs: PMutex::new(HashMap::new()),
             out_tx: out_tx.clone(),
         });
-
-        send_envelope(
-            &out_tx,
-            Message::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                role: Role::Publisher,
-                room: RoomCode(room.to_string()),
-            },
-        );
 
         let state_in = Arc::clone(&state);
         let inbound = tokio::spawn(async move {
