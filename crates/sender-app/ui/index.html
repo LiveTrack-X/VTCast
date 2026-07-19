@@ -92,7 +92,7 @@
 </div>
 
 <label>릴레이 URL</label>
-<input id="relay" value="https://vtcast.jamku.me">
+<input id="relay" value="https://vtcast.livetrack.kr">
 
 <div class="row">
   <div>
@@ -204,7 +204,7 @@ const setStatus = (text, cls) => {
 // Bumped to v2 with the 8080 → 17239 port change so existing installs
 // don't keep showing the old default in the relay URL field. Bump again
 // any time the meaning of a persisted field changes.
-const SETTINGS_KEY = 'vtcast:settings:v4';
+const SETTINGS_KEY = 'vtcast:settings:v5';
 const PERSIST_IDS = [
   'relay', 'room', 'encoder', 'fps', 'bitrate', 'backend', 'sourceKind',
   'ckEnabled', 'ckColor', 'ckThreshold', 'ckSoftness',

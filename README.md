@@ -1,8 +1,23 @@
 # VTCast
 
+> [!NOTE]
+> 이 저장소는 [LiveTrack-X](https://github.com/LiveTrack-X)가 운영하는 VTCast 배포판입니다.
+> 송신 앱의 기본 릴레이는 `https://vtcast.livetrack.kr`이며, 릴레이 연결 직후의
+> WebSocket Hello/Ping 경합을 보완한 빌드를 제공합니다.
+
 VTuber 아바타(VTubeStudio / VSeeFace / Warudo)를 **투명 배경 그대로** OBS의 Browser Source로 송출할 수 있는 자체 호스팅 가능한 P2P WebRTC 도구입니다. OBS 플러그인이 필요 없고, 역할별로 단일 Rust 바이너리 하나씩으로 동작합니다.
 
-기본 릴레이는 `https://vtcast.jamku.me`로 설정돼 있어 별도 서버 없이도 바로 사용 가능하지만, `vtcast-relay`를 직접 호스팅하면 모든 트래픽을 자신의 인프라 안에서 운영할 수 있습니다.
+기본 릴레이는 `https://vtcast.livetrack.kr`로 설정돼 있어 별도 서버 없이도 바로 사용 가능하지만, `vtcast-relay`를 직접 호스팅하면 모든 트래픽을 자신의 인프라 안에서 운영할 수 있습니다.
+
+## 다운로드 (Windows)
+
+[최신 GitHub Release](https://github.com/LiveTrack-X/VTCast/releases/latest)에서
+`VTCast_1.0.6_LiveTrack-X_x64_Portable.exe`를 내려받아 바로 실행하면 됩니다.
+설치 과정은 필요하지 않습니다.
+
+Windows SmartScreen이 표시되면 파일의 출처와 Release의 SHA-256 값을 확인한 후
+`추가 정보` → `실행`을 선택하세요. 현재 LiveTrack-X 배포판은 포터블 수동
+업데이트 방식이며, 인앱 자동업데이트용 서명 채널은 아직 발행하지 않습니다.
 
 ## 구성 요소
 
@@ -56,7 +71,7 @@ cargo run -p vtcast-sender -- --encoder nvenc
 송신자가 다음과 같은 줄을 출력합니다:
 
 ```
-OBS receiver URL: https://vtcast.jamku.me/r?room=fyryho
+OBS receiver URL: https://vtcast.livetrack.kr/r?room=fyryho
 ```
 
 (로컬 릴레이를 사용 중이면 `http://localhost:17239/r?room=...`)
@@ -97,7 +112,7 @@ vtcast-cli [--relay URL] [--room CODE] [--source spout|window|display]
 
 | 옵션 | 기본값 | 설명 |
 | --- | --- | --- |
-| `--relay` | `https://vtcast.jamku.me` | 시그널링 릴레이 베이스 URL. 자체 호스팅 릴레이를 쓰면 여기를 바꿈. |
+| `--relay` | `https://vtcast.livetrack.kr` | 시그널링 릴레이 베이스 URL. 자체 호스팅 릴레이를 쓰면 여기를 바꿈. |
 | `--room` | 자동 발급 | 룸 코드 지정. 생략 시 릴레이가 새 코드 발급. |
 | `--source` | (필수) | `spout` / `window` / `display` 중 하나. |
 | `--sender` | 첫 번째 송신 | Spout 송신 이름. 부분 일치. |
@@ -132,7 +147,7 @@ source "$HOME/.cargo/env"
 sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev
 
 # 2. 빌드
-git clone https://github.com/so0420/VTCast.git
+git clone https://github.com/LiveTrack-X/VTCast.git
 cd VTCast
 cargo build --release -p vtcast-relay --bin vtcast-relay
 

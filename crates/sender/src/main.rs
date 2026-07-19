@@ -10,8 +10,8 @@ use vtcast_sender::{ChromaKey, Config, EncoderBackend, EncoderKind, Pipeline, Pi
 #[derive(Parser, Debug)]
 #[command(name = "vtcast-cli", version)]
 struct Args {
-    /// Relay base URL (e.g. https://vtcast.jamku.me or http://localhost:17239)
-    #[arg(long, default_value = "https://vtcast.jamku.me")]
+    /// Relay base URL (e.g. https://vtcast.livetrack.kr or http://localhost:17239)
+    #[arg(long, default_value = "https://vtcast.livetrack.kr")]
     relay: String,
 
     /// Room code. If omitted, the sender asks the relay to mint a fresh
