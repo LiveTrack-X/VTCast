@@ -12,12 +12,27 @@ VTuber 아바타(VTubeStudio / VSeeFace / Warudo)를 **투명 배경 그대로**
 ## 다운로드 (Windows)
 
 [최신 GitHub Release](https://github.com/LiveTrack-X/VTCast/releases/latest)에서
-`VTCast_1.0.6_LiveTrack-X_x64_Portable.exe`를 내려받아 바로 실행하면 됩니다.
-설치 과정은 필요하지 않습니다.
+다음 중 하나를 내려받으면 됩니다.
 
-Windows SmartScreen이 표시되면 파일의 출처와 Release의 SHA-256 값을 확인한 후
-`추가 정보` → `실행`을 선택하세요. 현재 LiveTrack-X 배포판은 포터블 수동
-업데이트 방식이며, 인앱 자동업데이트용 서명 채널은 아직 발행하지 않습니다.
+- **권장:** `VTCast_1.0.7_x64-setup.exe` — 현재 사용자 계정에 설치하며, 이후 앱
+  안에서 서명된 업데이트를 내려받아 설치할 수 있습니다.
+- **포터블:** `VTCast_1.0.7_LiveTrack-X_x64_Portable.exe` — 설치 없이 바로
+  실행할 수 있습니다. 자동업데이트 확인 기능도 포함돼 있지만, 안정적인 교체와
+  시작 메뉴 등록이 필요하면 설치형을 권장합니다.
+
+앱은 시작할 때 새 버전을 확인하고, 업데이트가 있으면 앱 안에 업데이트 버튼을
+표시합니다. 다운로드 파일은 LiveTrack-X 업데이터 공개키로 서명을 검증한 뒤에만
+설치됩니다.
+
+> [!IMPORTANT]
+> `v1.0.6` 이하에는 이전 저장소의 공개키가 들어 있어 LiveTrack-X가 새로 서명한
+> 업데이트를 신뢰할 수 없습니다. 기존 사용자는 `v1.0.7` 설치형 또는 포터블을
+> **한 번만 수동으로 내려받아 실행**해야 하며, `v1.0.7`부터는 이후 릴리스를
+> 인앱 업데이트로 받을 수 있습니다.
+
+Windows SmartScreen이 표시되면 파일 출처가 `LiveTrack-X/VTCast` Release인지
+확인한 후 `추가 정보` → `실행`을 선택하세요. Tauri 업데이터 서명은 인앱
+업데이트의 무결성과 발행자를 검증하지만 Windows 코드 서명 인증서와는 별개입니다.
 
 ## 구성 요소
 
