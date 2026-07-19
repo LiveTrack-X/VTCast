@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, sign, and publish
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate tag and source versions
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref_name }}".TrimStart("v")
+          $tauriVersion = (Get-Content -Raw "crates/sender-app/tauri.conf.json" | ConvertFrom-Json).version
+          $manifest = Get-Content -Raw "Cargo.toml"
+          if ($manifest -notmatch '(?ms)\[workspace\.package\].*?^version = "([^"]+)"') {
+            throw "Could not read workspace.package.version from Cargo.toml"
+          }
+          $workspaceVersion = $Matches[1]
+          if ($tagVersion -ne $tauriVersion -or $tagVersion -ne $workspaceVersion) {
+            throw "Tag ($tagVersion), Tauri ($tauriVersion), and workspace ($workspaceVersion) versions must match"
+          }
+
+      - name: Build signed updater and draft release
+        id: tauri
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: VTCast __VERSION__
+          releaseBody: |
+            LiveTrack-X 공식 Windows 빌드입니다.
+
+            - 기본 릴레이: https://vtcast.livetrack.kr
+            - 앱 시작 시 새 버전 확인 및 서명 검증 후 인앱 업데이트
+            - 설치형(NSIS)과 설치 없는 포터블 EXE 제공
+
+            v1.0.6 이하 사용자는 LiveTrack-X 서명 키로 전환하기 위해 이번 버전을 한 번 수동 설치해야 합니다.
+          generateReleaseNotes: true
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          uploadUpdaterSignatures: true
+          projectPath: crates/sender-app
+          args: --bundles nsis
+
+      - name: Add portable build and publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $portable = "VTCast_${{ steps.tauri.outputs.appVersion }}_LiveTrack-X_x64_Portable.exe"
+          Copy-Item -LiteralPath "target/release/vtcast.exe" -Destination $portable
+          gh release upload "${{ github.ref_name }}" $portable --clobber
+          gh release edit "${{ github.ref_name }}" --draft=false
